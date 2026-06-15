@@ -349,8 +349,9 @@ uvicorn main:app --reload --port 8001
 
 | Name | Role |
 |------|------|
-| **Nouman Arif** | Developer |
-| **Umaim Tahir** | Developer |
+| **Nouman Arif** | Backend Engineer |
+| **Umaim Tahir** | App Developer |
+| **Abdul Samee** | App Developer |
 
 ---
 

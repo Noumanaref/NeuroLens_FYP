@@ -1,7 +1,6 @@
 from sqlalchemy import create_engine, text
 
-# Connect to default 'postgres' database, NOT neurolens_db
-engine = create_engine("postgresql://postgres:1234@localhost:5432/postgres")
+engine = create_engine("postgresql+pg8000://postgres:password@localhost:5432/postgres")
 
 with engine.connect() as conn:
     conn.execution_options(isolation_level="AUTOCOMMIT")
@@ -18,4 +17,4 @@ with engine.connect() as conn:
     conn.execute(text("DROP DATABASE IF EXISTS neurolens_db"))
     conn.execute(text("CREATE DATABASE neurolens_db"))
 
-print("✅ neurolens_db dropped and recreated successfully!")
+print("SUCCESS: neurolens_db dropped and recreated successfully!")

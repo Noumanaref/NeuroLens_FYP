@@ -23,10 +23,10 @@ def create_admin_user():
         existing_user = db.query(User).filter(User.username_hash == username_hash).first()
         
         if existing_user:
-            print("⚠️ Admin user already exists. Updating password...")
+            print("INFO: Admin user already exists. Updating password...")
             existing_user.password_hash = EncryptionService.hash_password(admin_password)
             db.commit()
-            print("✅ Admin password updated successfully!")
+            print("SUCCESS: Admin password updated successfully!")
             print(f"   Username: {admin_username}")
             print(f"   Password: {admin_password}")
             return
@@ -48,12 +48,12 @@ def create_admin_user():
         db.add(admin_user)
         db.commit()
         
-        print("✅ Admin user created successfully!")
+        print("SUCCESS: Admin user created successfully!")
         print(f"   Username: {admin_username}")
         print(f"   Password: {admin_password}")
         
     except Exception as e:
-        print(f"❌ Error creating admin user: {e}")
+        print(f"ERROR: Error creating admin user: {e}")
         db.rollback()
     finally:
         db.close()

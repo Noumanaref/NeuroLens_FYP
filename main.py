@@ -1457,11 +1457,34 @@ async def analyze_frame(
         except Exception as e:
             logger.error(f"Frame analysis error: {e}")
     
-    # ✅ Commit the content session even if no camera frame
+    # Save fallback/neutral emotion and commit the content session even if no camera frame
     try:
+        emotion_log = EmotionLog(
+            user_id=current_user.id,
+            username=username,
+            emotion="neutral",
+            intensity=0.5,
+            content_type=content_type or "UNKNOWN",
+            content_confidence=content_confidence or 0.0,
+            probabilities=json.dumps({"neutral": 1.0}),
+            is_guest=is_guest
+        )
+        db.add(emotion_log)
+        
+        if not is_guest:
+            user = db.query(User).filter(User.id == current_user.id).first()
+            if user:
+                user.current_emotion = "neutral"
+                user.current_emotion_intensity = 0.5
+                user.current_content = content_type or "UNKNOWN"
+                user.last_activity = datetime.now(timezone.utc)
+                user.is_recording = True
+                
         db.commit()
-    except Exception:
-        pass
+        print(f"INFO: Fallback Logged: {username} - neutral | {activity} on {content_type}")
+    except Exception as e:
+        print(f"ERROR: Failed to save fallback emotion log: {e}")
+        db.rollback()
     
     return {
         "emotion": "neutral",

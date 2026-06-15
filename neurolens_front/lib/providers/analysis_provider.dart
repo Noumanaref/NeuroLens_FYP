@@ -355,18 +355,6 @@ class AnalysisProvider with ChangeNotifier {
     _notificationService.clearAll();
     notifyListeners();
   }
-  
-  /// Mark notification as read
-  void markNotificationAsRead(String notificationId) {
-    _notificationService.markAsRead(notificationId);
-    notifyListeners();
-  }
-  
-  /// Clear all notifications
-  void clearAllNotifications() {
-    _notificationService.clearAll();
-    notifyListeners();
-  }
 
   @override
   void dispose() {

@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, R
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
+import uuid
 import random
 import json
 import logging
@@ -40,6 +41,10 @@ activity_classifier = None
 
 # In-memory session tracker: {user_id: {"content_type": ..., "activity": ..., "started_at": ..., "session_id": ...}}
 active_content_sessions = {}
+# Per-user cache for expensive content/activity classification done during frame analysis.
+analysis_context_cache = {}
+# Refresh interval to avoid polling APIs on every single frame.
+ANALYSIS_CONTEXT_REFRESH_SECONDS = 3.0
 
 def get_fast_content_detector():
     """Get fast Windows API-based content detector (no ML models)"""
@@ -697,9 +702,11 @@ def login(credentials: UserLogin, request: Request, db: Session = Depends(get_db
 def guest_login():
     """Guest mode - no signup required, limited features"""
     
-    guest_id = f"guest_{datetime.now().timestamp()}"
+    # Use a negative integer space for guests so they never collide with real user IDs.
+    guest_user_id = -((uuid.uuid4().int % 2_000_000_000) + 1)
+    guest_id = f"guest_{abs(guest_user_id)}"
     token = create_access_token(
-        data={"sub": guest_id, "is_guest": True},
+        data={"sub": guest_id, "guest_id": guest_id, "user_id": guest_user_id, "is_guest": True},
         expires_delta=timedelta(hours=24)
     )
     
@@ -708,7 +715,7 @@ def guest_login():
     return LoginResponse(
         token=token,
         user=UserResponse(
-            id=0,
+            id=guest_user_id,
             name="Guest User",
             email="guest@neurolens.app",
             username=guest_id
@@ -719,13 +726,13 @@ def guest_login():
 @app.get("/api/auth/me", response_model=UserResponse)
 def get_me(current_user: User = Depends(get_current_user)):
     """Get current user"""
-    # Handle guest users
-    if current_user.id == 0 or not current_user.email_encrypted:
+    if getattr(current_user, 'is_guest', False) or current_user.id == 0 or not current_user.email_encrypted:
+        guest_username = getattr(current_user, 'username', 'guest')
         return UserResponse(
-            id=0,
+            id=current_user.id,
             name="Guest User",
             email="guest@neurolens.app",
-            username="guest"
+            username=guest_username
         )
     
     return UserResponse(
@@ -899,11 +906,12 @@ def get_profile(
     
     is_guest = getattr(current_user, 'is_guest', False)
     if is_guest or current_user.id == 0:
+        guest_username = getattr(current_user, 'username', 'guest')
         return {
-            "id": 0,
+            "id": current_user.id,
             "name": "Guest User",
             "email": "guest@neurolens.app",
-            "username": "guest",
+            "username": guest_username,
             "is_guest": True
         }
     
@@ -1222,6 +1230,7 @@ def stop_recording(
     if is_guest or current_user.id == 0:
         # Clear in-memory session for guest
         active_content_sessions.pop(current_user.id, None)
+        analysis_context_cache.pop(current_user.id, None)
         return {"status": "idle", "message": "Guest recording stopped"}
     
     try:
@@ -1243,6 +1252,7 @@ def stop_recording(
         
         # Clear in-memory tracker
         active_content_sessions.pop(current_user.id, None)
+        analysis_context_cache.pop(current_user.id, None)
         
         db.commit()
         print(f"⏹️ Recording stopped for user: {current_user.id} ({len(active_sessions)} session(s) closed)")
@@ -1271,68 +1281,103 @@ async def analyze_frame(
         except ValueError:
             username = f"user_{current_user.id}"
     
-    # ===== CONTENT CLASSIFICATION (Windows API - fast, no ML) =====
+    # ===== CONTENT + ACTIVITY CONTEXT (cached to keep emotion response fast) =====
     content_type = None
     content_confidence = None
     app_name = ""
     window_title = ""
-    
-    fast_detector = get_fast_content_detector()
-    if fast_detector:
+    activity = 'BROWSING'
+    activity_emoji = '🌐'
+    activity_confidence = 'Low'
+    productivity = 'NEUTRAL'
+    productivity_emoji = '➖'
+    content_details = {}
+
+    now_utc = datetime.now(timezone.utc)
+    cached_context = analysis_context_cache.get(current_user.id)
+    context_is_fresh = (
+        cached_context is not None and
+        (now_utc - cached_context['updated_at']).total_seconds() < ANALYSIS_CONTEXT_REFRESH_SECONDS
+    )
+
+    if context_is_fresh:
+        content_type = cached_context.get('content_type')
+        content_confidence = cached_context.get('content_confidence')
+        app_name = cached_context.get('app_name', '')
+        window_title = cached_context.get('window_title', '')
+        activity = cached_context.get('activity', 'BROWSING')
+        activity_emoji = cached_context.get('activity_emoji', '🌐')
+        activity_confidence = cached_context.get('activity_confidence', 'Low')
+        productivity = cached_context.get('productivity', 'NEUTRAL')
+        productivity_emoji = cached_context.get('productivity_emoji', '➖')
+        content_details = cached_context.get('content_details', {})
+    else:
+        fast_detector = get_fast_content_detector()
+        if fast_detector:
+            try:
+                content_result = fast_detector.categorize_from_window()
+                content_type = content_result.get('category', 'OTHER')
+                app_name = content_result.get('app', '')
+                window_title = content_result.get('title', '')
+                confidence_map = {'Very High': 0.95, 'High': 0.80, 'Medium': 0.60, 'Low': 0.40}
+                content_confidence = confidence_map.get(content_result.get('confidence', 'Low'), 0.40)
+            except Exception as e:
+                print(f"⚠️ Content detection failed: {e}")
+
+        activity_result = _classify_activity(app_name, window_title, content_type or "")
+        activity = activity_result.get('activity', 'BROWSING')
+        activity_emoji = activity_result.get('emoji', '🌐')
+        activity_confidence = activity_result.get('confidence', 'Low')
+
+        productivity_result = _get_productivity(activity, content_type)
+        productivity = productivity_result['classification']
+        productivity_emoji = productivity_result['emoji']
+
+        content_details = {
+            'app_name': app_name,
+            'window_title': window_title[:200],
+            'activity': activity,
+            'activity_emoji': activity_emoji,
+            'activity_confidence': activity_confidence,
+            'productivity': productivity,
+            'productivity_emoji': productivity_emoji,
+        }
+
+        print(f"📊 Content: {content_type} | Activity: {activity_emoji} {activity} | Productivity: {productivity_emoji} {productivity}")
+
+        # Update session only when context is refreshed to reduce per-frame DB overhead.
         try:
-            content_result = fast_detector.categorize_from_window()
-            content_type = content_result.get('category', 'OTHER')
-            app_name = content_result.get('app', '')
-            window_title = content_result.get('title', '')
-            confidence_map = {'Very High': 0.95, 'High': 0.80, 'Medium': 0.60, 'Low': 0.40}
-            content_confidence = confidence_map.get(content_result.get('confidence', 'Low'), 0.40)
+            _update_content_session(
+                db=db,
+                user_id=current_user.id,
+                username=username,
+                content_type=content_type or "UNKNOWN",
+                content_confidence=content_confidence,
+                activity=activity,
+                activity_emoji=activity_emoji,
+                activity_confidence=activity_confidence,
+                productivity=productivity,
+                productivity_emoji=productivity_emoji,
+                app_name=app_name,
+                window_title=window_title,
+                is_guest=is_guest
+            )
         except Exception as e:
-            print(f"⚠️ Content detection failed: {e}")
-    
-    # ===== ACTIVITY CLASSIFICATION (WATCHING, READING, CODING, etc.) =====
-    activity_result = _classify_activity(app_name, window_title, content_type or "")
-    activity = activity_result.get('activity', 'BROWSING')
-    activity_emoji = activity_result.get('emoji', '🌐')
-    activity_confidence = activity_result.get('confidence', 'Low')
-    
-    # ===== PRODUCTIVITY CLASSIFICATION =====
-    productivity_result = _get_productivity(activity, content_type)
-    productivity = productivity_result['classification']
-    productivity_emoji = productivity_result['emoji']
-    
-    # Build content details dict for API response
-    content_details = {
-        'app_name': app_name,
-        'window_title': window_title[:200],
-        'activity': activity,
-        'activity_emoji': activity_emoji,
-        'activity_confidence': activity_confidence,
-        'productivity': productivity,
-        'productivity_emoji': productivity_emoji,
-    }
-    
-    print(f"📊 Content: {content_type} | Activity: {activity_emoji} {activity} | Productivity: {productivity_emoji} {productivity}")
-    
-    # ===== CONTENT SESSION TIME TRACKING =====
-    session_id = None
-    try:
-        session_id = _update_content_session(
-            db=db,
-            user_id=current_user.id,
-            username=username,
-            content_type=content_type or "UNKNOWN",
-            content_confidence=content_confidence,
-            activity=activity,
-            activity_emoji=activity_emoji,
-            activity_confidence=activity_confidence,
-            productivity=productivity,
-            productivity_emoji=productivity_emoji,
-            app_name=app_name,
-            window_title=window_title,
-            is_guest=is_guest
-        )
-    except Exception as e:
-        print(f"⚠️ Session tracking error: {e}")
+            print(f"⚠️ Session tracking error: {e}")
+
+        analysis_context_cache[current_user.id] = {
+            'updated_at': now_utc,
+            'content_type': content_type,
+            'content_confidence': content_confidence,
+            'app_name': app_name,
+            'window_title': window_title,
+            'activity': activity,
+            'activity_emoji': activity_emoji,
+            'activity_confidence': activity_confidence,
+            'productivity': productivity,
+            'productivity_emoji': productivity_emoji,
+            'content_details': content_details,
+        }
     
     # ===== EMOTION DETECTION =====
     if file:

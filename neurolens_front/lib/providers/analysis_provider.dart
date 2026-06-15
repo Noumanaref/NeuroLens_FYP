@@ -12,6 +12,7 @@ import 'package:http/http.dart' as http;
 class AnalysisProvider with ChangeNotifier {
   final ApiService _apiService = ApiService();
   final NotificationService _notificationService = NotificationService();
+  static const Duration _analysisInterval = Duration(seconds: 1);
 
   EmotionModel? _currentEmotion;
   ContentModel? _currentContent;
@@ -27,9 +28,12 @@ class AnalysisProvider with ChangeNotifier {
   bool _multipleFacesDetected = false;
   int _detectedFaceCount = 0;
   String? _multipleFacesError;
+  DateTime? _lastRecommendationFetchAt;
+  String? _lastRecommendationSignature;
   
   // Callback for showing error popup (set by UI)
   Function(String message, int faceCount)? onMultipleFacesDetected;
+  Function(Map<String, dynamic> payload)? onRecommendationReceived;
 
   EmotionModel? get currentEmotion => _currentEmotion;
   ContentModel? get currentContent => _currentContent;
@@ -84,8 +88,8 @@ class AnalysisProvider with ChangeNotifier {
     
     notifyListeners();
 
-    // ✅ Capture and send frames every 2 seconds (30 frames per minute) - balanced for performance
-    _analysisTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
+    // Faster capture cadence improves perceived real-time emotion changes.
+    _analysisTimer = Timer.periodic(_analysisInterval, (timer) async {
       // Skip if previous request is still processing
       if (_isProcessingFrame) {
         print('⏳ Skipping frame - previous request still processing');
@@ -200,12 +204,58 @@ class AnalysisProvider with ChangeNotifier {
         }
 
         notifyListeners();
+
+        // Keep recommendations async so emotion updates are not delayed.
+        unawaited(_fetchRecommendationsIfDue());
       } catch (e) {
         print('❌ Error analyzing frame: $e');
       } finally {
         _isProcessingFrame = false;  // Unlock - allow next frame
       }
     });
+  }
+
+  Future<void> _fetchRecommendationsIfDue() async {
+    final now = DateTime.now();
+
+    if (_lastRecommendationFetchAt != null &&
+        now.difference(_lastRecommendationFetchAt!) < const Duration(seconds: 30)) {
+      return;
+    }
+
+    _lastRecommendationFetchAt = now;
+
+    try {
+      final response = await _apiService.get('/api/recommendations');
+      final recommendations = List<Map<String, dynamic>>.from(
+        response['recommendations'] ?? [],
+      );
+
+      if (recommendations.isEmpty) {
+        return;
+      }
+
+      final triggerEmotion = (response['trigger_emotion'] ?? 'neutral').toString();
+      final triggerReason = (response['trigger_reason'] ?? '').toString();
+      final firstTitle = (recommendations.first['title'] ?? '').toString();
+      final signature = '$triggerEmotion|$triggerReason|$firstTitle';
+
+      if (signature == _lastRecommendationSignature) {
+        return;
+      }
+
+      _lastRecommendationSignature = signature;
+
+      if (onRecommendationReceived != null) {
+        onRecommendationReceived!({
+          'recommendations': recommendations,
+          'trigger_emotion': response['trigger_emotion'],
+          'trigger_reason': response['trigger_reason'],
+        });
+      }
+    } catch (e) {
+      print('⚠️ Failed to fetch recommendations for global popup: $e');
+    }
   }
 
   /// Send frame to backend API with multipart form data
@@ -260,6 +310,7 @@ class AnalysisProvider with ChangeNotifier {
     _analysisTimer?.cancel();
     _analysisTimer = null;
     _cameraController = null;  // Don't dispose, just clear reference
+    _lastRecommendationFetchAt = null;
     
     // ✅ Notify backend that recording stopped
     try {
@@ -289,6 +340,19 @@ class AnalysisProvider with ChangeNotifier {
     _contentHistory.clear();
     _currentEmotion = null;
     _currentContent = null;
+    _lastRecommendationSignature = null;
+    notifyListeners();
+  }
+  
+  /// Mark notification as read
+  void markNotificationAsRead(String notificationId) {
+    _notificationService.markAsRead(notificationId);
+    notifyListeners();
+  }
+  
+  /// Clear all notifications
+  void clearAllNotifications() {
+    _notificationService.clearAll();
     notifyListeners();
   }
   
